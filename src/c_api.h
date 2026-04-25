@@ -75,6 +75,7 @@ NCNN_EXPORT void ncnn_option_set_use_bf16_packed(ncnn_option_t opt, int enable);
 NCNN_EXPORT void ncnn_option_set_use_bf16_storage(ncnn_option_t opt, int enable);
 NCNN_EXPORT void ncnn_option_set_use_shader_local_memory(ncnn_option_t opt, int enable);
 NCNN_EXPORT void ncnn_option_set_use_cooperative_matrix(ncnn_option_t opt, int enable);
+NCNN_EXPORT void ncnn_option_set_use_mapped_model_loading(ncnn_option_t opt, int enable);
 
 /* mat api */
 typedef struct __ncnn_mat_t* ncnn_mat_t;

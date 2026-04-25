@@ -349,6 +349,11 @@ void ncnn_option_set_use_cooperative_matrix(ncnn_option_t opt, int enable)
 #endif
 }
 
+void ncnn_option_set_use_mapped_model_loading(ncnn_option_t opt, int enable)
+{
+    ((Option*)opt)->use_mapped_model_loading = enable;
+}
+
 /* mat api */
 ncnn_mat_t ncnn_mat_create()
 {
