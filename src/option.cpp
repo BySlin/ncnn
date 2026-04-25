@@ -54,7 +54,11 @@ Option::Option()
     flush_denormals = 3;
     use_reserved_2f = false;
     use_reserved_3f = false;
+#if __APPLE__
+    use_mapped_model_loading = true;
+#else
     use_mapped_model_loading = false;
+#endif
 
     use_local_pool_allocator = true;
 
