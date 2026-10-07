@@ -14,17 +14,19 @@ BUILD_ROOT="${SCRIPT_DIR}/build_ios"
 DOWNLOAD_DIR="${BUILD_ROOT}/downloads"
 OPENMP_SRC_DIR="${BUILD_ROOT}/openmp-${OPENMP_VERSION}.src"
 CMAKE_SRC_DIR="${BUILD_ROOT}/cmake-${OPENMP_VERSION}.src"
-OPENMP_BUILD_DIR="${OPENMP_SRC_DIR}/build-arm64"
-OPENMP_INSTALL_DIR="${OPENMP_BUILD_DIR}/install"
-OPENMP_HEADER_DIR="${OPENMP_INSTALL_DIR}/include"
-OPENMP_LIBRARY_FILE="${OPENMP_INSTALL_DIR}/lib/libomp.a"
-NCNN_BUILD_DIR="${BUILD_ROOT}/ncnn-build-arm64"
-NCNN_INSTALL_DIR="${BUILD_ROOT}/install-ios-arm64"
-PACKAGE_DIR="${BUILD_ROOT}/package-ios-arm64"
+PACKAGE_DIR_IOS="${BUILD_ROOT}/package-ios-arm64"
+PACKAGE_DIR_SIMULATOR="${BUILD_ROOT}/package-ios-simulator"
+PACKAGE_DIR_XCFRAMEWORK="${BUILD_ROOT}/package-xcframework"
 
 PATCH_1="ef8c35bcf5d9cfdb0764ffde6a63c04ec715bc37.patch"
 PATCH_2="5c12711f9a21f41bea70566bf15a4026804d6b20.patch"
 
+# A slice is <sdk>-<arch>: ios-arm64, ios-simulator-arm64, ios-simulator-x86_64
+DEVICE_SLICE="ios-arm64"
+SIMULATOR_ARCHS="${SIMULATOR_ARCHS:-arm64 x86_64}"
+SIMULATOR_SLICES=()
+
+SIMULATOR=1
 CLEAN=0
 
 usage() {
@@ -33,12 +35,14 @@ Usage: ./build_ios.sh [options]
 
 Options:
   --vulkan ON|OFF   Build ncnn with Vulkan (default: ON)
+  --no-simulator    Build the device slice only, skip simulator and xcframework
   --clean           Clean ${BUILD_ROOT} build outputs before building
   -h, --help        Show this help
 
 Environment overrides:
   OPENMP_VERSION
   IOS_DEPLOYMENT_TARGET
+  SIMULATOR_ARCHS   Simulator archs to build (default: "arm64 x86_64")
   ENABLE_BITCODE
   ENABLE_ARC
   ENABLE_VISIBILITY
@@ -55,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --vulkan=*)
       VULKAN="${1#*=}"
+      shift
+      ;;
+    --no-simulator)
+      SIMULATOR=0
       shift
       ;;
     --clean)
@@ -78,6 +86,49 @@ if [[ "${VULKAN}" != "ON" && "${VULKAN}" != "OFF" ]]; then
   exit 1
 fi
 
+if [[ "${SIMULATOR}" -eq 1 ]]; then
+  for arch in ${SIMULATOR_ARCHS}; do
+    if [[ "${arch}" != "arm64" && "${arch}" != "x86_64" ]]; then
+      echo "SIMULATOR_ARCHS only supports arm64 and x86_64, got: ${arch}"
+      exit 1
+    fi
+    SIMULATOR_SLICES+=("ios-simulator-${arch}")
+  done
+  if [[ "${#SIMULATOR_SLICES[@]}" -eq 0 ]]; then
+    echo "SIMULATOR_ARCHS is empty; use --no-simulator to skip the simulator build"
+    exit 1
+  fi
+fi
+
+slice_platform() {
+  case "$1" in
+    ios-arm64) echo "OS64" ;;
+    ios-simulator-arm64) echo "SIMULATORARM64" ;;
+    ios-simulator-x86_64) echo "SIMULATOR64" ;;
+    *) echo "unknown slice: $1" >&2; exit 1 ;;
+  esac
+}
+
+slice_arch() {
+  echo "${1##*-}"
+}
+
+openmp_build_dir() {
+  echo "${OPENMP_SRC_DIR}/build-$1"
+}
+
+openmp_install_dir() {
+  echo "$(openmp_build_dir "$1")/install"
+}
+
+ncnn_build_dir() {
+  echo "${BUILD_ROOT}/ncnn-build-$1"
+}
+
+ncnn_install_dir() {
+  echo "${BUILD_ROOT}/install-$1"
+}
+
 require_tools() {
   local tools=(
     cmake
@@ -87,6 +138,7 @@ require_tools() {
     git
     libtool
     xcrun
+    xcodebuild
     zip
     sed
   )
@@ -177,98 +229,118 @@ apply_openmp_patches() {
   popd >/dev/null
 }
 
-build_openmp_arm64() {
-  echo "[build] openmp arm64"
-  cmake -S "${OPENMP_SRC_DIR}" -B "${OPENMP_BUILD_DIR}" \
+build_openmp() {
+  local slice="$1"
+  local build_dir install_dir
+  build_dir="$(openmp_build_dir "${slice}")"
+  install_dir="$(openmp_install_dir "${slice}")"
+
+  echo "[build] openmp ${slice}"
+  cmake -S "${OPENMP_SRC_DIR}" -B "${build_dir}" \
     -DCMAKE_TOOLCHAIN_FILE="${SCRIPT_DIR}/toolchains/ios.toolchain.cmake" \
     -DDEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
     -DENABLE_BITCODE="${ENABLE_BITCODE}" \
     -DENABLE_ARC="${ENABLE_ARC}" \
     -DENABLE_VISIBILITY="${ENABLE_VISIBILITY}" \
-    -DCMAKE_INSTALL_PREFIX="${OPENMP_INSTALL_DIR}" \
+    -DCMAKE_INSTALL_PREFIX="${install_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLIBOMP_ENABLE_SHARED=OFF \
     -DLIBOMP_OMPT_SUPPORT=OFF \
     -DLIBOMP_USE_HWLOC=OFF \
-    -DPLATFORM=OS64 \
-    -DARCHS=arm64
+    -DPLATFORM="$(slice_platform "${slice}")" \
+    -DARCHS="$(slice_arch "${slice}")"
 
-  cmake --build "${OPENMP_BUILD_DIR}" -j "$(num_jobs)"
-  cmake --build "${OPENMP_BUILD_DIR}" --target install
+  cmake --build "${build_dir}" -j "$(num_jobs)"
+  cmake --build "${build_dir}" --target install
 }
 
 normalize_openmp_artifacts() {
+  local slice="$1"
+  local build_dir install_dir
+  build_dir="$(openmp_build_dir "${slice}")"
+  install_dir="$(openmp_install_dir "${slice}")"
+
   local header_candidate=""
   local lib_candidate=""
 
-  if [[ -f "${OPENMP_INSTALL_DIR}/include/omp.h" ]]; then
-    header_candidate="${OPENMP_INSTALL_DIR}/include"
-  elif [[ -f "${OPENMP_BUILD_DIR}/runtime/src/omp.h" ]]; then
-    header_candidate="${OPENMP_BUILD_DIR}/runtime/src"
+  if [[ -f "${install_dir}/include/omp.h" ]]; then
+    header_candidate="${install_dir}/include"
+  elif [[ -f "${build_dir}/runtime/src/omp.h" ]]; then
+    header_candidate="${build_dir}/runtime/src"
   elif [[ -f "${OPENMP_SRC_DIR}/runtime/src/omp.h" ]]; then
     header_candidate="${OPENMP_SRC_DIR}/runtime/src"
   fi
 
-  if [[ -f "${OPENMP_INSTALL_DIR}/lib/libomp.a" ]]; then
-    lib_candidate="${OPENMP_INSTALL_DIR}/lib/libomp.a"
-  elif [[ -f "${OPENMP_BUILD_DIR}/runtime/src/libomp.a" ]]; then
-    lib_candidate="${OPENMP_BUILD_DIR}/runtime/src/libomp.a"
-  elif [[ -f "${OPENMP_BUILD_DIR}/runtime/src/libiomp5.a" ]]; then
-    lib_candidate="${OPENMP_BUILD_DIR}/runtime/src/libiomp5.a"
-  elif [[ -f "${OPENMP_BUILD_DIR}/runtime/src/libgomp.a" ]]; then
-    lib_candidate="${OPENMP_BUILD_DIR}/runtime/src/libgomp.a"
+  if [[ -f "${install_dir}/lib/libomp.a" ]]; then
+    lib_candidate="${install_dir}/lib/libomp.a"
+  elif [[ -f "${build_dir}/runtime/src/libomp.a" ]]; then
+    lib_candidate="${build_dir}/runtime/src/libomp.a"
+  elif [[ -f "${build_dir}/runtime/src/libiomp5.a" ]]; then
+    lib_candidate="${build_dir}/runtime/src/libiomp5.a"
+  elif [[ -f "${build_dir}/runtime/src/libgomp.a" ]]; then
+    lib_candidate="${build_dir}/runtime/src/libgomp.a"
   fi
 
   if [[ -z "${header_candidate}" || -z "${lib_candidate}" ]]; then
-    echo "failed to locate OpenMP headers or library"
+    echo "failed to locate OpenMP headers or library for ${slice}"
     echo "header_candidate=${header_candidate}"
     echo "lib_candidate=${lib_candidate}"
     exit 1
   fi
 
-  ensure_dir "${OPENMP_INSTALL_DIR}/include"
-  ensure_dir "${OPENMP_INSTALL_DIR}/lib"
+  ensure_dir "${install_dir}/include"
+  ensure_dir "${install_dir}/lib"
 
-  if [[ "${header_candidate}/omp.h" != "${OPENMP_INSTALL_DIR}/include/omp.h" ]]; then
-    cp -f "${header_candidate}/omp.h" "${OPENMP_INSTALL_DIR}/include/omp.h"
+  if [[ "${header_candidate}/omp.h" != "${install_dir}/include/omp.h" ]]; then
+    cp -f "${header_candidate}/omp.h" "${install_dir}/include/omp.h"
   fi
   if [[ -f "${header_candidate}/ompx.h" ]]; then
-    if [[ "${header_candidate}/ompx.h" != "${OPENMP_INSTALL_DIR}/include/ompx.h" ]]; then
-      cp -f "${header_candidate}/ompx.h" "${OPENMP_INSTALL_DIR}/include/ompx.h"
+    if [[ "${header_candidate}/ompx.h" != "${install_dir}/include/ompx.h" ]]; then
+      cp -f "${header_candidate}/ompx.h" "${install_dir}/include/ompx.h"
     fi
   fi
-  if [[ "${lib_candidate}" != "${OPENMP_INSTALL_DIR}/lib/libomp.a" ]]; then
-    cp -f "${lib_candidate}" "${OPENMP_INSTALL_DIR}/lib/libomp.a"
+  if [[ "${lib_candidate}" != "${install_dir}/lib/libomp.a" ]]; then
+    cp -f "${lib_candidate}" "${install_dir}/lib/libomp.a"
   fi
-
-  OPENMP_HEADER_DIR="${OPENMP_INSTALL_DIR}/include"
-  OPENMP_LIBRARY_FILE="${OPENMP_INSTALL_DIR}/lib/libomp.a"
 }
 
-build_ncnn_arm64() {
-  echo "[build] ncnn arm64 (VULKAN=${VULKAN})"
+build_ncnn() {
+  local slice="$1"
+  local build_dir install_dir openmp_dir
+  build_dir="$(ncnn_build_dir "${slice}")"
+  install_dir="$(ncnn_install_dir "${slice}")"
+  openmp_dir="$(openmp_install_dir "${slice}")"
+
+  echo "[build] ncnn ${slice} (VULKAN=${VULKAN})"
 
   ensure_submodules
 
-  cmake -S "${SCRIPT_DIR}" -B "${NCNN_BUILD_DIR}" \
+  cmake -S "${SCRIPT_DIR}" -B "${build_dir}" \
     -DCMAKE_TOOLCHAIN_FILE="${SCRIPT_DIR}/toolchains/ios.toolchain.cmake" \
     -DDEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
     -DENABLE_BITCODE="${ENABLE_BITCODE}" \
     -DENABLE_ARC="${ENABLE_ARC}" \
     -DENABLE_VISIBILITY="${ENABLE_VISIBILITY}" \
-    -DCMAKE_INSTALL_PREFIX="${NCNN_INSTALL_DIR}" \
+    -DCMAKE_INSTALL_PREFIX="${install_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DPLATFORM=OS64 \
-    -DARCHS=arm64 \
-    -DOpenMP_C_FLAGS="-Xclang -fopenmp -I${OPENMP_HEADER_DIR}" \
-    -DOpenMP_CXX_FLAGS="-Xclang -fopenmp -I${OPENMP_HEADER_DIR}" \
+    -DPLATFORM="$(slice_platform "${slice}")" \
+    -DARCHS="$(slice_arch "${slice}")" \
+    -DOpenMP_C_FLAGS="-Xclang -fopenmp -I${openmp_dir}/include" \
+    -DOpenMP_CXX_FLAGS="-Xclang -fopenmp -I${openmp_dir}/include" \
     -DOpenMP_C_LIB_NAMES=libomp \
     -DOpenMP_CXX_LIB_NAMES=libomp \
-    -DOpenMP_libomp_LIBRARY="${OPENMP_LIBRARY_FILE}" \
+    -DOpenMP_libomp_LIBRARY="${openmp_dir}/lib/libomp.a" \
     -DNCNN_VULKAN="${VULKAN}"
 
-  cmake --build "${NCNN_BUILD_DIR}" -j "$(num_jobs)"
-  cmake --build "${NCNN_BUILD_DIR}" --target install
+  cmake --build "${build_dir}" -j "$(num_jobs)"
+  cmake --build "${build_dir}" --target install
+}
+
+build_slice() {
+  local slice="$1"
+  build_openmp "${slice}"
+  normalize_openmp_artifacts "${slice}"
+  build_ncnn "${slice}"
 }
 
 init_framework_layout() {
@@ -284,25 +356,60 @@ init_framework_layout() {
   ln -s Versions/Current/${binary_name} "${framework_path}/${binary_name}"
 }
 
-package_frameworks() {
-  echo "[package] frameworks"
-  ensure_dir "${PACKAGE_DIR}"
+# merge the same static library of every slice into one (fat) file
+merge_libraries() {
+  local output="$1"
+  shift
 
-  local openmp_framework="${PACKAGE_DIR}/openmp.framework"
-  local ncnn_framework="${PACKAGE_DIR}/ncnn.framework"
-  local glslang_framework="${PACKAGE_DIR}/glslang.framework"
+  if [[ $# -eq 1 ]]; then
+    cp "$1" "${output}"
+  else
+    xcrun lipo -create "$@" -o "${output}"
+  fi
+}
+
+# package_frameworks <package dir> <slice>...
+# headers are taken from the first slice
+package_frameworks() {
+  local package_dir="$1"
+  shift
+  local slices=("$@")
+  local first_slice="${slices[0]}"
+
+  echo "[package] frameworks ${slices[*]}"
+  ensure_dir "${package_dir}"
+
+  local openmp_framework="${package_dir}/openmp.framework"
+  local ncnn_framework="${package_dir}/ncnn.framework"
+  local glslang_framework="${package_dir}/glslang.framework"
+
+  local slice
+  local openmp_libs=()
+  local ncnn_libs=()
+  local glslang_libs=()
+  for slice in "${slices[@]}"; do
+    openmp_libs+=("$(openmp_install_dir "${slice}")/lib/libomp.a")
+    ncnn_libs+=("$(ncnn_install_dir "${slice}")/lib/libncnn.a")
+    if [[ "${VULKAN}" == "ON" ]]; then
+      libtool -static \
+        "$(ncnn_install_dir "${slice}")/lib/libglslang.a" \
+        "$(ncnn_install_dir "${slice}")/lib/libSPIRV.a" \
+        -o "$(ncnn_install_dir "${slice}")/lib/libglslang_combined.a"
+      glslang_libs+=("$(ncnn_install_dir "${slice}")/lib/libglslang_combined.a")
+    fi
+  done
 
   init_framework_layout "${openmp_framework}" "openmp"
-  cp "${OPENMP_INSTALL_DIR}/lib/libomp.a" "${openmp_framework}/Versions/A/openmp"
-  cp -a "${OPENMP_INSTALL_DIR}/include/"* "${openmp_framework}/Versions/A/Headers/"
+  merge_libraries "${openmp_framework}/Versions/A/openmp" "${openmp_libs[@]}"
+  cp -a "$(openmp_install_dir "${first_slice}")/include/"* "${openmp_framework}/Versions/A/Headers/"
   sed -e 's/__NAME__/openmp/g' \
       -e 's/__IDENTIFIER__/org.llvm.openmp/g' \
       -e 's/__VERSION__/18.1/g' \
       "${SCRIPT_DIR}/Info.plist" > "${openmp_framework}/Versions/A/Resources/Info.plist"
 
   init_framework_layout "${ncnn_framework}" "ncnn"
-  cp "${NCNN_INSTALL_DIR}/lib/libncnn.a" "${ncnn_framework}/Versions/A/ncnn"
-  cp -a "${NCNN_INSTALL_DIR}/include/"* "${ncnn_framework}/Versions/A/Headers/"
+  merge_libraries "${ncnn_framework}/Versions/A/ncnn" "${ncnn_libs[@]}"
+  cp -a "$(ncnn_install_dir "${first_slice}")/include/"* "${ncnn_framework}/Versions/A/Headers/"
   sed -e 's/__NAME__/ncnn/g' \
       -e 's/__IDENTIFIER__/com.tencent.ncnn/g' \
       -e 's/__VERSION__/1.0/g' \
@@ -310,12 +417,8 @@ package_frameworks() {
 
   if [[ "${VULKAN}" == "ON" ]]; then
     init_framework_layout "${glslang_framework}" "glslang"
-    libtool -static \
-      "${NCNN_INSTALL_DIR}/lib/libglslang.a" \
-      "${NCNN_INSTALL_DIR}/lib/libSPIRV.a" \
-      -o "${NCNN_INSTALL_DIR}/lib/libglslang_combined.a"
-    cp "${NCNN_INSTALL_DIR}/lib/libglslang_combined.a" "${glslang_framework}/Versions/A/glslang"
-    cp -a "${NCNN_INSTALL_DIR}/include/glslang" "${glslang_framework}/Versions/A/Headers/"
+    merge_libraries "${glslang_framework}/Versions/A/glslang" "${glslang_libs[@]}"
+    cp -a "$(ncnn_install_dir "${first_slice}")/include/glslang" "${glslang_framework}/Versions/A/Headers/"
     sed -e 's/__NAME__/glslang/g' \
         -e 's/__IDENTIFIER__/org.khronos.glslang/g' \
         -e 's/__VERSION__/1.0/g' \
@@ -323,35 +426,70 @@ package_frameworks() {
   fi
 }
 
-zip_package() {
-  pushd "${PACKAGE_DIR}" >/dev/null
-  local zip_name="ncnn-ios-arm64-local.zip"
+framework_names() {
   if [[ "${VULKAN}" == "ON" ]]; then
-    zip_name="ncnn-ios-arm64-vulkan-local.zip"
-    rm -f "${zip_name}"
-    zip -9 -y -r "${zip_name}" openmp.framework glslang.framework ncnn.framework >/dev/null
+    echo "openmp glslang ncnn"
   else
-    rm -f "${zip_name}"
-    zip -9 -y -r "${zip_name}" openmp.framework ncnn.framework >/dev/null
+    echo "openmp ncnn"
   fi
+}
+
+package_xcframeworks() {
+  echo "[package] xcframeworks"
+  ensure_dir "${PACKAGE_DIR_XCFRAMEWORK}"
+
+  local name
+  for name in $(framework_names); do
+    rm -rf "${PACKAGE_DIR_XCFRAMEWORK}/${name}.xcframework"
+    xcodebuild -create-xcframework \
+      -framework "${PACKAGE_DIR_IOS}/${name}.framework" \
+      -framework "${PACKAGE_DIR_SIMULATOR}/${name}.framework" \
+      -output "${PACKAGE_DIR_XCFRAMEWORK}/${name}.xcframework"
+  done
+}
+
+# zip_package <package dir> <zip name without suffix> <bundle suffix>
+zip_package() {
+  local package_dir="$1"
+  local zip_name="$2"
+  local suffix="$3"
+
+  if [[ "${VULKAN}" == "ON" ]]; then
+    zip_name="${zip_name}-vulkan"
+  fi
+  zip_name="${zip_name}-local.zip"
+
+  local name
+  local bundles=()
+  for name in $(framework_names); do
+    bundles+=("${name}.${suffix}")
+  done
+
+  pushd "${package_dir}" >/dev/null
+  rm -f "${zip_name}"
+  zip -9 -y -r "${zip_name}" "${bundles[@]}" >/dev/null
   popd >/dev/null
+
+  echo "Zip: ${package_dir}/${zip_name}"
 }
 
 print_summary() {
   echo ""
   echo "Done."
   echo "Build root: ${BUILD_ROOT}"
-  echo "OpenMP lib: ${OPENMP_INSTALL_DIR}/lib/libomp.a"
-  echo "NCNN lib:   ${NCNN_INSTALL_DIR}/lib/libncnn.a"
-  echo "Frameworks: ${PACKAGE_DIR}"
 
-  xcrun lipo -info "${PACKAGE_DIR}/openmp.framework/openmp"
-  xcrun lipo -info "${PACKAGE_DIR}/ncnn.framework/ncnn"
-  if [[ "${VULKAN}" == "ON" ]]; then
-    xcrun lipo -info "${PACKAGE_DIR}/glslang.framework/glslang"
-    echo "Zip: ${PACKAGE_DIR}/ncnn-ios-arm64-vulkan-local.zip"
-  else
-    echo "Zip: ${PACKAGE_DIR}/ncnn-ios-arm64-local.zip"
+  local name
+  echo "Frameworks (ios): ${PACKAGE_DIR_IOS}"
+  for name in $(framework_names); do
+    xcrun lipo -info "${PACKAGE_DIR_IOS}/${name}.framework/${name}"
+  done
+
+  if [[ "${SIMULATOR}" -eq 1 ]]; then
+    echo "Frameworks (ios-simulator): ${PACKAGE_DIR_SIMULATOR}"
+    for name in $(framework_names); do
+      xcrun lipo -info "${PACKAGE_DIR_SIMULATOR}/${name}.framework/${name}"
+    done
+    echo "XCFrameworks: ${PACKAGE_DIR_XCFRAMEWORK}"
   fi
 }
 
@@ -365,12 +503,25 @@ main() {
 
   prepare_openmp_source
   apply_openmp_patches
-  build_openmp_arm64
-  normalize_openmp_artifacts
-  build_ncnn_arm64
-  package_frameworks
-  zip_package
+
+  build_slice "${DEVICE_SLICE}"
+  package_frameworks "${PACKAGE_DIR_IOS}" "${DEVICE_SLICE}"
+
+  if [[ "${SIMULATOR}" -eq 1 ]]; then
+    local slice
+    for slice in "${SIMULATOR_SLICES[@]}"; do
+      build_slice "${slice}"
+    done
+    package_frameworks "${PACKAGE_DIR_SIMULATOR}" "${SIMULATOR_SLICES[@]}"
+    package_xcframeworks
+  fi
+
   print_summary
+  zip_package "${PACKAGE_DIR_IOS}" "ncnn-ios-arm64" "framework"
+  if [[ "${SIMULATOR}" -eq 1 ]]; then
+    zip_package "${PACKAGE_DIR_SIMULATOR}" "ncnn-ios-simulator" "framework"
+    zip_package "${PACKAGE_DIR_XCFRAMEWORK}" "ncnn-ios" "xcframework"
+  fi
 }
 
 main
