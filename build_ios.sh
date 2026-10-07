@@ -23,7 +23,7 @@ PATCH_2="5c12711f9a21f41bea70566bf15a4026804d6b20.patch"
 
 # A slice is <sdk>-<arch>: ios-arm64, ios-simulator-arm64, ios-simulator-x86_64
 DEVICE_SLICE="ios-arm64"
-SIMULATOR_ARCHS="${SIMULATOR_ARCHS:-arm64 x86_64}"
+SIMULATOR_ARCHS="${SIMULATOR_ARCHS:-arm64}"
 SIMULATOR_SLICES=()
 
 SIMULATOR=1
@@ -42,7 +42,7 @@ Options:
 Environment overrides:
   OPENMP_VERSION
   IOS_DEPLOYMENT_TARGET
-  SIMULATOR_ARCHS   Simulator archs to build (default: "arm64 x86_64")
+  SIMULATOR_ARCHS   Simulator archs to build, arm64 and/or x86_64 (default: "arm64")
   ENABLE_BITCODE
   ENABLE_ARC
   ENABLE_VISIBILITY
